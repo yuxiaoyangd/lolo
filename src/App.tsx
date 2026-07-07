@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import ChatWindow from './components/ChatWindow';
 import ChatInput from './components/ChatInput';
 import { streamChat } from './api';
-import type { ChatMessage, ToolCallEntry } from './types';
+import type { ChatMessage } from './types';
 
 let nextId = 1;
 function uid(): string {
@@ -10,7 +10,7 @@ function uid(): string {
 }
 
 export default function App() {
-  const [timeline, setTimeline] = useState<(ChatMessage | ToolCallEntry)[]>([]);
+  const [timeline, setTimeline] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
 
   const send = useCallback(async (text: string) => {
@@ -19,9 +19,7 @@ export default function App() {
     setTimeline(updatedTimeline);
     setIsStreaming(true);
 
-    const apiMessages = updatedTimeline
-      .filter((item): item is ChatMessage => 'role' in item)
-      .map((m) => ({ role: m.role, content: m.content }));
+    const apiMessages = updatedTimeline.map((m) => ({ role: m.role, content: m.content }));
 
     let assistantId = '';
     let assistantContent = '';
@@ -42,27 +40,8 @@ export default function App() {
             assistantContent += event.content;
             setTimeline((prev) =>
               prev.map((item) =>
-                'role' in item && item.id === assistantId
+                item.id === assistantId
                   ? { ...item, content: assistantContent }
-                  : item
-              )
-            );
-            break;
-          }
-          case 'tool_call': {
-            const toolEntry: ToolCallEntry = {
-              id: uid(),
-              name: event.name,
-              arguments: event.arguments,
-            };
-            setTimeline((prev) => [...prev, toolEntry]);
-            break;
-          }
-          case 'tool_result': {
-            setTimeline((prev) =>
-              prev.map((item) =>
-                !('role' in item) && item.result === undefined
-                  ? { ...item, result: event.content, success: event.success }
                   : item
               )
             );
@@ -79,7 +58,7 @@ export default function App() {
             assistantContent += `\n\n⚠️ 错误: ${event.content}`;
             setTimeline((prev) =>
               prev.map((item) =>
-                'role' in item && item.id === assistantId
+                item.id === assistantId
                   ? { ...item, content: assistantContent }
                   : item
               )

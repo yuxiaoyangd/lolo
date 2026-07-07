@@ -1,15 +1,10 @@
 import { useEffect, useRef } from 'react';
 import MessageBubble from './MessageBubble';
-import ToolCallCard from './ToolCallCard';
-import type { ChatMessage, ToolCallEntry } from '../types';
+import type { ChatMessage } from '../types';
 
 interface Props {
-  timeline: (ChatMessage | ToolCallEntry)[];
+  timeline: ChatMessage[];
   isStreaming: boolean;
-}
-
-function isMessage(item: ChatMessage | ToolCallEntry): item is ChatMessage {
-  return 'role' in item;
 }
 
 export default function ChatWindow({ timeline, isStreaming }: Props) {
@@ -28,18 +23,14 @@ export default function ChatWindow({ timeline, isStreaming }: Props) {
           <p>你好，我是lolo</p>
         </div>
       )}
-      {timeline.map((item) =>
-        isMessage(item) ? (
-          <MessageBubble
-            key={item.id}
-            role={item.role}
-            content={item.content}
-            isStreaming={item.role === 'assistant' && isStreaming && item === timeline[timeline.length - 1]}
-          />
-        ) : (
-          <ToolCallCard key={item.id} tool={item} />
-        )
-      )}
+      {timeline.map((item) => (
+        <MessageBubble
+          key={item.id}
+          role={item.role}
+          content={item.content}
+          isStreaming={item.role === 'assistant' && isStreaming && item === timeline[timeline.length - 1]}
+        />
+      ))}
       <div ref={bottomRef} />
     </div>
   );

@@ -31,5 +31,4 @@ app.get('/health', (_req, res) => {
 const PORT = process.env.LOLO_PORT || 3000;
 app.listen(PORT, () => {
   console.log(`lolo server → http://localhost:${PORT}`);
-  console.log(`  → NODEXA_URL: ${process.env.NODEXA_URL || 'http://localhost:8080'}`);
 });
