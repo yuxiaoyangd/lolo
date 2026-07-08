@@ -65,6 +65,9 @@ export default function App() {
             );
             break;
           }
+          case 'debug':
+            console.log('[lolo] → LLM', event);
+            break;
           case 'done':
             setIsStreaming(false);
             break;
