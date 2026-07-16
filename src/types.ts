@@ -7,5 +7,5 @@ export interface ChatMessage {
 export type StreamEvent =
   | { type: 'text'; content: string }
   | { type: 'error'; content: string }
-  | { type: 'done' }
-  | { type: 'debug'; messages: unknown; tools: unknown };
+  | { type: 'approval_required'; approvalId: string; action: string; message: string }
+  | { type: 'done' };

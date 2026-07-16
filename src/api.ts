@@ -9,6 +9,26 @@ export async function* streamChat(
     body: JSON.stringify({ messages }),
   });
 
+  yield* readEventStream(response);
+}
+
+export async function* streamApproval(approvalId: string): AsyncGenerator<StreamEvent> {
+  const response = await fetch(`/approvals/${encodeURIComponent(approvalId)}/confirm`, {
+    method: 'POST',
+  });
+  yield* readEventStream(response);
+}
+
+export async function rejectApproval(approvalId: string): Promise<void> {
+  const response = await fetch(`/approvals/${encodeURIComponent(approvalId)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+}
+
+async function* readEventStream(response: Response): AsyncGenerator<StreamEvent> {
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }

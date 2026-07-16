@@ -9,9 +9,11 @@
     "dev:ui": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "tsx --test server/tool-approval.test.ts server/time-context.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "concurrently": "^10.0.3",

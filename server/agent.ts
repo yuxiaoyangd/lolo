@@ -1,28 +1,41 @@
+import { randomUUID } from 'node:crypto';
 import { client, MODEL } from './llm';
-import { fetchTools, execute, type ToolDef } from './nodexa';
+import { callMcpTool, listMcpTools, type ModelTool } from './mcp';
+import {
+  formatApprovalSuccess,
+  getApprovalRequest,
+  getToolFailureMessage,
+} from './tool-approval';
+import { buildCurrentTimeContext } from './time-context';
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
+const MAX_TOOL_ROUNDS = 6;
+const APPROVAL_TTL_MS = 15 * 60 * 1000;
 
-const SYSTEM_PROMPT = `你是 lolo，一个通用 AI Agent。可以陪你聊天、解答问题，也可以对接现实服务。
+const SYSTEM_PROMPT = `你是 lolo，一个通用 AI Agent。请自然、准确、简洁地帮助用户。
 
-所有服务内容都是隐藏的，不要主动和用户提起服务内容。请仅在用户明确表达相关意图时使用对应工具，否则正常对话即可。`;
+你可以使用 MCP 工具完成现实服务请求。必须遵守：
+1. 信息不足时先向用户追问，不得猜测地址、时间或服务要求。
+2. 严格遵循 MCP 服务器提供的工具描述、输入 Schema、结构化结果和下一步建议。
+3. 不得编造业务标识符；工具返回的引用值必须原样使用。
+4. 对标注为 destructive 的工具必须等待界面用户审批，不得自行确认。
+5. 金额字段以分为单位，向用户展示时换算为元。
+6. 不得依赖模型自身记忆判断当前日期；必须使用本次请求附带的服务器时间基准。`;
 
-let cachedTools: ToolDef[] | null = null;
-
-async function getTools(): Promise<ToolDef[]> {
-  if (!cachedTools) {
-    try {
-      cachedTools = await fetchTools();
-      console.log(`[lolo] 已加载 ${cachedTools.length} 个工具`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[lolo] Nodexa 不可用，本次降级为纯聊天模式: ${msg}`);
-      return [];
-    }
-  }
-  return cachedTools;
+interface PendingApproval {
+  toolName: string;
+  args: Record<string, unknown>;
+  expiresAt: number;
 }
+
+interface ToolCallAccumulator {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+const pendingApprovals = new Map<string, PendingApproval>();
 
 async function retryLLM<T>(fn: () => Promise<T>, label: string): Promise<T> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -49,115 +62,235 @@ function sse(type: string, data: Record<string, unknown> = {}) {
 export async function* chat(
   messages: { role: string; content: string | null }[]
 ): AsyncGenerator<string> {
-  const tools = await getTools();
+  let tools: ModelTool[] = [];
+  try {
+    tools = await listMcpTools();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[lolo] MCP unavailable, continuing without tools: ${message}`);
+  }
 
   const fullMessages: Array<Record<string, unknown>> = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    {
+      role: 'system',
+      content: `${SYSTEM_PROMPT}\n\n${buildCurrentTimeContext()}`,
+    },
     ...messages,
   ];
 
-  yield sse('debug', { messages: fullMessages, tools });
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const stream = await createModelStream(fullMessages, tools);
+    const toolCalls = new Map<number, ToolCallAccumulator>();
+    let assistantContent = '';
 
-  const stream1 = await retryLLM(
-    () =>
-      client.chat.completions.create({
-        model: MODEL,
-        messages: fullMessages as never,
-        ...(tools.length > 0 ? { tools: tools as never, tool_choice: 'auto' as const } : {}),
-        stream: true,
-      }),
-    'LLM'
-  );
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta;
+      if (!delta) continue;
 
-  const toolCallAcc = new Map<number, { id: string; name: string; arguments: string }>();
+      if (delta.content) {
+        assistantContent += delta.content;
+        yield sse('text', { content: delta.content });
+      }
 
-  for await (const chunk of stream1) {
-    const delta = chunk.choices[0]?.delta;
-    if (!delta) continue;
-
-    if (delta.content) {
-      yield sse('text', { content: delta.content });
+      for (const toolCall of delta.tool_calls || []) {
+        const current = toolCalls.get(toolCall.index) || { id: '', name: '', arguments: '' };
+        if (toolCall.id) current.id = toolCall.id;
+        if (toolCall.function?.name) current.name += toolCall.function.name;
+        if (toolCall.function?.arguments) current.arguments += toolCall.function.arguments;
+        toolCalls.set(toolCall.index, current);
+      }
     }
 
-    if (delta.tool_calls) {
-      for (const tcDelta of delta.tool_calls) {
-        const idx = tcDelta.index;
-        if (!toolCallAcc.has(idx)) {
-          toolCallAcc.set(idx, { id: '', name: '', arguments: '' });
-        }
-        const acc = toolCallAcc.get(idx)!;
-        if (tcDelta.id) acc.id = tcDelta.id;
-        if (tcDelta.function) {
-          if (tcDelta.function.name) acc.name += tcDelta.function.name;
-          if (tcDelta.function.arguments) acc.arguments += tcDelta.function.arguments;
-        }
+    if (toolCalls.size === 0) {
+      yield sse('done');
+      return;
+    }
+
+    const calls = [...toolCalls.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, call], index) => ({
+        ...call,
+        id: call.id || `tool_${round}_${index}`,
+      }));
+
+    fullMessages.push({
+      role: 'assistant',
+      content: assistantContent || null,
+      tool_calls: calls.map((call) => ({
+        id: call.id,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      })),
+    });
+
+    let resultApproval: {
+      approvalId: string;
+      action: string;
+      message: string;
+    } | null = null;
+
+    for (const call of calls) {
+      const args = parseToolArguments(call.arguments);
+      if (!args) {
+        fullMessages.push(toolMessage(call.id, { ok: false, error: 'INVALID_TOOL_ARGUMENTS' }));
+        continue;
       }
+
+      const toolDefinition = tools.find((tool) => tool.function.name === call.name);
+      if (toolDefinition?.annotations?.destructiveHint === true) {
+        const approvalId = createApproval(call.name, args);
+        fullMessages.push(
+          toolMessage(call.id, {
+            ok: false,
+            error: 'USER_APPROVAL_REQUIRED',
+            approvalId,
+          })
+        );
+        fullMessages.push({
+          role: 'system',
+          content:
+            '危险操作已被代码拦截。请清楚展示待执行操作的服务商、时间、地址、金额或取消原因，并要求用户使用界面按钮确认。',
+        });
+        yield* streamWithoutTools(fullMessages);
+        yield sse('approval_required', {
+          approvalId,
+          action: call.name,
+          message: `确认执行 ${toolDefinition.function.description}？`,
+        });
+        yield sse('done');
+        return;
+      }
+
+      const result = await callMcpTool(call.name, args);
+      fullMessages.push(toolMessage(call.id, result));
+
+      const approvalRequest = getApprovalRequest(result);
+      if (approvalRequest) {
+        if (resultApproval) {
+          yield sse('error', { content: '一次只能处理一个待确认操作，请重新发起。' });
+          yield sse('done');
+          return;
+        }
+        resultApproval = {
+          approvalId: createApproval(approvalRequest.toolName, approvalRequest.args),
+          action: approvalRequest.toolName,
+          message: approvalRequest.message,
+        };
+      }
+    }
+
+    if (resultApproval) {
+      fullMessages.push({
+        role: 'system',
+        content:
+          '工具返回了需要用户显式确认的后续操作。请准确展示结构化结果中的关键信息，并告知用户必须点击界面确认按钮后才会执行。不要自行调用后续工具。',
+      });
+      yield* streamWithoutTools(fullMessages);
+      yield sse('approval_required', {
+        approvalId: resultApproval.approvalId,
+        action: resultApproval.action,
+        message: resultApproval.message,
+      });
+      yield sse('done');
+      return;
     }
   }
 
-  if (toolCallAcc.size === 0) {
+  yield sse('error', { content: '工具调用轮次过多，已停止执行。' });
+  yield sse('done');
+}
+
+export async function* confirmApproval(approvalId: string): AsyncGenerator<string> {
+  const approval = takeApproval(approvalId);
+  if (!approval) {
+    yield sse('error', { content: '确认请求不存在或已过期，请重新发起操作。' });
     yield sse('done');
     return;
   }
 
-  const sortedIndices = [...toolCallAcc.keys()].sort((a, b) => a - b);
-
-  for (const idx of sortedIndices) {
-    const acc = toolCallAcc.get(idx)!;
-    let args: Record<string, unknown> = {};
-    try {
-      args = JSON.parse(acc.arguments);
-    } catch {
-      /* ignore */
-    }
-
-    fullMessages.push({
-      role: 'assistant',
-      tool_calls: [
-        {
-          id: acc.id,
-          type: 'function',
-          function: { name: acc.name, arguments: acc.arguments },
-        },
-      ],
-      content: null,
+  const result = await callMcpTool(approval.toolName, approval.args);
+  if (result.ok !== true) {
+    yield sse('error', {
+      content: getToolFailureMessage(approval.toolName, result),
     });
-
-    try {
-      const result = await execute(acc.name, args);
-      const content = typeof result === 'string' ? result : JSON.stringify(result);
-      fullMessages.push({
-        role: 'tool',
-        tool_call_id: acc.id,
-        content,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      yield sse('error', { content: `服务调用失败: ${msg}` });
-      fullMessages.push({
-        role: 'tool',
-        tool_call_id: acc.id,
-        content: JSON.stringify({ error: msg }),
-      });
-    }
+    yield sse('done');
+    return;
   }
 
-  const stream2 = await retryLLM(
+  yield sse('text', {
+    content: formatApprovalSuccess(approval.toolName, result),
+  });
+  yield sse('done');
+}
+
+export function rejectApproval(approvalId: string): boolean {
+  cleanupExpiredApprovals();
+  return pendingApprovals.delete(approvalId);
+}
+
+async function createModelStream(messages: Array<Record<string, unknown>>, tools: ModelTool[]) {
+  return retryLLM(
     () =>
       client.chat.completions.create({
         model: MODEL,
-        messages: fullMessages as never,
+        messages: messages as never,
+        ...(tools.length ? { tools: tools as never, tool_choice: 'auto' as const } : {}),
         stream: true,
       }),
-    'LLM总结'
+    'LLM'
   );
+}
 
-  for await (const chunk of stream2) {
-    const delta = chunk.choices[0]?.delta;
-    if (delta?.content) {
-      yield sse('text', { content: delta.content });
-    }
+async function* streamWithoutTools(
+  messages: Array<Record<string, unknown>>
+): AsyncGenerator<string> {
+  const stream = await createModelStream(messages, []);
+  for await (const chunk of stream) {
+    const content = chunk.choices[0]?.delta?.content;
+    if (content) yield sse('text', { content });
   }
+}
 
-  yield sse('done');
+function toolMessage(toolCallId: string, result: Record<string, unknown>) {
+  return {
+    role: 'tool',
+    tool_call_id: toolCallId,
+    content: JSON.stringify(result),
+  };
+}
+
+function parseToolArguments(value: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(value || '{}');
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function createApproval(toolName: string, args: Record<string, unknown>): string {
+  cleanupExpiredApprovals();
+  const approvalId = randomUUID();
+  pendingApprovals.set(approvalId, {
+    toolName,
+    args,
+    expiresAt: Date.now() + APPROVAL_TTL_MS,
+  });
+  return approvalId;
+}
+
+function takeApproval(approvalId: string): PendingApproval | null {
+  cleanupExpiredApprovals();
+  const approval = pendingApprovals.get(approvalId) || null;
+  if (approval) pendingApprovals.delete(approvalId);
+  return approval;
+}
+
+function cleanupExpiredApprovals(): void {
+  const now = Date.now();
+  for (const [id, approval] of pendingApprovals) {
+    if (approval.expiresAt <= now) pendingApprovals.delete(id);
+  }
 }

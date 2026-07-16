@@ -6,6 +6,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/chat': 'http://localhost:3000',
+      '/approvals': 'http://localhost:3000',
     },
   },
 })
