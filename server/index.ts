@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { chat, confirmApproval, rejectApproval } from './agent.js';
-import { closeMcpClient } from './mcp.js';
+import { closeMcpClient, getMcpStatus } from './mcp.js';
 
 const app = express();
 app.use(cors());
@@ -47,6 +47,15 @@ app.delete('/approvals/:approvalId', (req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.get('/health/mcp', async (_req, res) => {
+  try {
+    const status = await getMcpStatus();
+    res.json({ status: 'ok', ...status });
+  } catch {
+    res.status(503).json({ status: 'unavailable', connected: false });
+  }
 });
 
 const PORT = process.env.LOLO_PORT || 3000;

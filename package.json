@@ -9,7 +9,7 @@
     "dev:ui": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "tsx --test server/tool-approval.test.ts server/time-context.test.ts",
+    "test": "tsx --test server/tool-approval.test.ts server/time-context.test.ts server/mcp-connection.test.ts server/agent-policy.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

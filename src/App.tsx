@@ -23,6 +23,17 @@ export default function App() {
 
     for await (const event of stream) {
       switch (event.type) {
+        case 'mcp_status':
+          console.info(
+            `[lolo] MCP ${event.connected ? 'connected' : 'unavailable'}`,
+            event.toolCount === undefined ? {} : { toolCount: event.toolCount }
+          );
+          break;
+        case 'llm_request_debug':
+          console.groupCollapsed(`[lolo] LLM request · ${event.label}`);
+          console.log(JSON.stringify(event.request, null, 2));
+          console.groupEnd();
+          break;
         case 'text': {
           if (!assistantId) {
             assistantId = uid();

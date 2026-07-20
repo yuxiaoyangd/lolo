@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import type { ChatCompletionCreateParamsStreaming } from 'openai/resources/chat/completions';
 import { client, MODEL } from './llm';
 import { callMcpTool, listMcpTools, type ModelTool } from './mcp';
+import {
+  buildAgentSystemPrompt,
+  EXTERNAL_TOOLS_UNAVAILABLE_CONTEXT,
+  externalToolUnavailableResult,
+} from './agent-policy';
 import {
   formatApprovalSuccess,
   getApprovalRequest,
@@ -12,16 +18,7 @@ const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_TOOL_ROUNDS = 6;
 const APPROVAL_TTL_MS = 15 * 60 * 1000;
-
-const SYSTEM_PROMPT = `你是 lolo，一个通用 AI Agent。请自然、准确、简洁地帮助用户。
-
-你可以使用 MCP 工具完成现实服务请求。必须遵守：
-1. 信息不足时先向用户追问，不得猜测地址、时间或服务要求。
-2. 严格遵循 MCP 服务器提供的工具描述、输入 Schema、结构化结果和下一步建议。
-3. 不得编造业务标识符；工具返回的引用值必须原样使用。
-4. 对标注为 destructive 的工具必须等待界面用户审批，不得自行确认。
-5. 金额字段以分为单位，向用户展示时换算为元。
-6. 不得依赖模型自身记忆判断当前日期；必须使用本次请求附带的服务器时间基准。`;
+const DEBUG_LLM_REQUESTS = /^(1|true|yes|on)$/iu.test(process.env.LOLO_DEBUG_LLM || '');
 
 interface PendingApproval {
   toolName: string;
@@ -33,6 +30,14 @@ interface ToolCallAccumulator {
   id: string;
   name: string;
   arguments: string;
+}
+
+interface LlmRequest {
+  model: string;
+  messages: Array<Record<string, unknown>>;
+  stream: true;
+  tools?: ModelTool[];
+  tool_choice?: 'auto';
 }
 
 const pendingApprovals = new Map<string, PendingApproval>();
@@ -63,23 +68,40 @@ export async function* chat(
   messages: { role: string; content: string | null }[]
 ): AsyncGenerator<string> {
   let tools: ModelTool[] = [];
+  let mcpConnected = false;
   try {
     tools = await listMcpTools();
+    mcpConnected = true;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[lolo] MCP unavailable, continuing without tools: ${message}`);
+    console.warn(`[lolo] MCP unavailable, continuing without external tools: ${message}`);
+    yield sse('mcp_status', { connected: false });
+  }
+
+  if (tools.length === 0) {
+    console.warn('[lolo] No external tools available; continuing in conversation-only mode.');
+    if (mcpConnected) yield sse('mcp_status', { connected: true, toolCount: 0 });
+  } else {
+    yield sse('mcp_status', { connected: true, toolCount: tools.length });
   }
 
   const fullMessages: Array<Record<string, unknown>> = [
     {
       role: 'system',
-      content: `${SYSTEM_PROMPT}\n\n${buildCurrentTimeContext()}`,
+      content: `${buildAgentSystemPrompt(tools.length > 0)}\n\n${buildCurrentTimeContext()}`,
     },
     ...messages,
   ];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const stream = await createModelStream(fullMessages, tools);
+    const request = buildLlmRequest(fullMessages, tools);
+    if (DEBUG_LLM_REQUESTS) {
+      yield sse('llm_request_debug', {
+        label: `tool_round_${round + 1}`,
+        request,
+      });
+    }
+    const stream = await createModelStream(request);
     const toolCalls = new Map<number, ToolCallAccumulator>();
     let assistantContent = '';
 
@@ -129,10 +151,18 @@ export async function* chat(
       message: string;
     } | null = null;
 
+    let externalToolsAvailable = true;
+    let externalToolFailure = false;
+
     for (const call of calls) {
       const args = parseToolArguments(call.arguments);
       if (!args) {
         fullMessages.push(toolMessage(call.id, { ok: false, error: 'INVALID_TOOL_ARGUMENTS' }));
+        continue;
+      }
+
+      if (!externalToolsAvailable) {
+        fullMessages.push(toolMessage(call.id, externalToolUnavailableResult()));
         continue;
       }
 
@@ -149,9 +179,9 @@ export async function* chat(
         fullMessages.push({
           role: 'system',
           content:
-            '危险操作已被代码拦截。请清楚展示待执行操作的服务商、时间、地址、金额或取消原因，并要求用户使用界面按钮确认。',
+            '危险操作已被代码拦截。请清楚展示即将执行的操作、关键参数和可能影响，并要求用户使用界面按钮确认。',
         });
-        yield* streamWithoutTools(fullMessages);
+        yield* streamWithoutTools(fullMessages, 'destructive_approval_summary');
         yield sse('approval_required', {
           approvalId,
           action: call.name,
@@ -161,7 +191,18 @@ export async function* chat(
         return;
       }
 
-      const result = await callMcpTool(call.name, args);
+      let result: Record<string, unknown>;
+      try {
+        result = await callMcpTool(call.name, args);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[lolo] External tool call failed; continuing conversation: ${message}`);
+        externalToolsAvailable = false;
+        externalToolFailure = true;
+        tools = [];
+        result = externalToolUnavailableResult();
+        yield sse('mcp_status', { connected: false });
+      }
       fullMessages.push(toolMessage(call.id, result));
 
       const approvalRequest = getApprovalRequest(result);
@@ -179,13 +220,20 @@ export async function* chat(
       }
     }
 
+    if (externalToolFailure) {
+      fullMessages.push({
+        role: 'system',
+        content: EXTERNAL_TOOLS_UNAVAILABLE_CONTEXT,
+      });
+    }
+
     if (resultApproval) {
       fullMessages.push({
         role: 'system',
         content:
           '工具返回了需要用户显式确认的后续操作。请准确展示结构化结果中的关键信息，并告知用户必须点击界面确认按钮后才会执行。不要自行调用后续工具。',
       });
-      yield* streamWithoutTools(fullMessages);
+      yield* streamWithoutTools(fullMessages, 'server_confirmation_summary');
       yield sse('approval_required', {
         approvalId: resultApproval.approvalId,
         action: resultApproval.action,
@@ -208,7 +256,17 @@ export async function* confirmApproval(approvalId: string): AsyncGenerator<strin
     return;
   }
 
-  const result = await callMcpTool(approval.toolName, approval.args);
+  let result: Record<string, unknown>;
+  try {
+    result = await callMcpTool(approval.toolName, approval.args);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[lolo] Approved external operation could not be executed: ${message}`);
+    yield sse('mcp_status', { connected: false });
+    yield sse('error', { content: '暂时无法完成这个操作，请稍后再试。' });
+    yield sse('done');
+    return;
+  }
   if (result.ok !== true) {
     yield sse('error', {
       content: getToolFailureMessage(approval.toolName, result),
@@ -228,23 +286,37 @@ export function rejectApproval(approvalId: string): boolean {
   return pendingApprovals.delete(approvalId);
 }
 
-async function createModelStream(messages: Array<Record<string, unknown>>, tools: ModelTool[]) {
+function buildLlmRequest(
+  messages: Array<Record<string, unknown>>,
+  tools: ModelTool[]
+): LlmRequest {
+  return {
+    model: MODEL,
+    messages,
+    ...(tools.length ? { tools, tool_choice: 'auto' as const } : {}),
+    stream: true,
+  };
+}
+
+async function createModelStream(request: LlmRequest) {
   return retryLLM(
     () =>
-      client.chat.completions.create({
-        model: MODEL,
-        messages: messages as never,
-        ...(tools.length ? { tools: tools as never, tool_choice: 'auto' as const } : {}),
-        stream: true,
-      }),
+      client.chat.completions.create(
+        request as unknown as ChatCompletionCreateParamsStreaming
+      ),
     'LLM'
   );
 }
 
 async function* streamWithoutTools(
-  messages: Array<Record<string, unknown>>
+  messages: Array<Record<string, unknown>>,
+  label: string
 ): AsyncGenerator<string> {
-  const stream = await createModelStream(messages, []);
+  const request = buildLlmRequest(messages, []);
+  if (DEBUG_LLM_REQUESTS) {
+    yield sse('llm_request_debug', { label, request });
+  }
+  const stream = await createModelStream(request);
   for await (const chunk of stream) {
     const content = chunk.choices[0]?.delta?.content;
     if (content) yield sse('text', { content });
